@@ -7,7 +7,7 @@ services:
 
   minio:
     image: minio/minio
-    container_name: storage
+    container_name: html_storage
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -27,15 +27,33 @@ services:
     depends_on:
       - redis
       - minio
+    env_file:
+      - .env
+  mongo:
+    image: mongo
+    container_name: pages_database
+    ports:
+      - "${MONGO_PORT}:${MONGO_PORT}"
+    env_file:
+      - .env
+    volumes:
+      - pages:/data/db
+  parser:
+    build: .
+    container_name: parser
+    command: python -u parser.py
+    volumes:
+      - .:/app
+    depends_on:
+      - mongo
+      - redis
+      - minio
+    env_file:
+      - .env
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - S3_ENDPOINT=http://minio:9000
-      - S3_BUCKET=html-storage
-      - AWS_ACCESS_KEY=minioadmin
-      - AWS_SECRET_ACCESS_KEY=minioadmin
-      - TASKS_PER_CONTAINER=2
+      - MONGO_URI=mongodb://${MONGO_USER}:${MONGO_PASSWORD}@${MONGO_HOST}:${MONGO_PORT}
 
 
 volumes:
   minio_data:
+  pages:

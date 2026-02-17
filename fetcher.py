@@ -2,7 +2,7 @@ import os
 
 import asyncio
 import aiohttp
-import boto3
+import aioboto3
 import json
 import hashlib
 import socket
@@ -21,8 +21,10 @@ S3_BUCKET = os.getenv("S3_BUCKET", "html_storage")
 AWS_KEY = os.getenv("AWS_ACCESS_KEY", "minioadmin")
 AWS_SECRET = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
 
-TASKS_PER_CONTAINER = int(os.getenv("TASKS_PER_CONTAINER", 50))
+MAX_RETRIES = 3
+RETRY_TTL = 600
 
+TASKS_PER_CONTAINER = int(os.getenv("TASKS_PER_FETCHER", 50))
 
 r = redis.Redis(
     host=REDIS_HOST, 
@@ -31,13 +33,7 @@ r = redis.Redis(
 )
 
 
-s3_client = boto3.client(
-    "s3",
-    endpoint_url=S3_ENDPOINT,
-    aws_access_key_id=AWS_KEY,
-    aws_secret_access_key=AWS_SECRET,
-    config=Config(signature_version='s3v4')
-)
+s3_session = aioboto3.Session()
 
 
 headers = {
@@ -46,6 +42,12 @@ headers = {
 }
 
 
+STATS = {
+    "fetched": 0,
+    "failed": 0,
+    "retried": 0
+}
+
 
 def hash_url(url: str) -> str:
     url_bytes = url.encode('utf-8')
@@ -53,77 +55,91 @@ def hash_url(url: str) -> str:
     return hash_object.hexdigest()
 
 
-async def upload_to_s3(file_name: str, content: bytes):
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None, 
-        lambda: s3_client.put_object(
-            Bucket=S3_BUCKET, 
-            Key=file_name, 
-            Body=content,
-        )
-    )
+async def make_report():
+    while True:
+        await asyncio.sleep(60)
+        print(f"--- FETCHER REPORT ---")
+        print(f"Fetched: {STATS['fetched']}")
+        print(f"Failed: {STATS['failed']}")
+        print(f"Retried: {STATS['retried']}")
+        print("-------------------------")
 
 
 async def fetch_url(task_id: int):
-    async with aiohttp.ClientSession(headers=headers) as session:
-        while True:
-            task_raw = await r.blpop(FETCH_QUEUE, timeout=5)
+    async with aiohttp.ClientSession(headers=headers) as http_session:
+        async with s3_session.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=AWS_KEY,
+            aws_secret_access_key=AWS_SECRET,
+            config=Config(signature_version='s3v4')
+        ) as s3_client:
+            while True:
+                task_raw = await r.blpop(FETCH_QUEUE, timeout=5)
 
-            if not task_raw:
-                print("No tasks detected")
-                continue
+                if not task_raw:
+                    continue
 
-            url = task_raw[1]
-            print(f"Received task to fetch {url}")
-            
-            try:
-                start_time = time.time()
-                async with session.get(url, timeout=10) as response:
-                    if response.status != 200:
-                        text = await response.text()
-                        print(f"[{task_id}] Failed {url}: HTTP {response.status} {text}")
-                        continue
-                    html_content = await response.read()
-
-                file_name = f"{hash_url(url)}.html"
-                await upload_to_s3(file_name, html_content)
-
-                message = json.dumps({
-                    "url": url,
-                    "s3_key": file_name,
-                    "fetched_at": time.time(),
-                    "worker": task_id,
-                })
+                url = task_raw[1]
                 
-                await r.rpush(PARSE_QUEUE, message)
-                
-                duration = time.time() - start_time
-                print(f"[{task_id}] Fetched {url} in {duration:.2f}s")
+                try:
+                    async with http_session.get(url, timeout=10) as response:
+                        retry_key = f"retry:{hash_url(url)}"
+                        if response.status >= 500 or response.status == 429:
+                            current_try = await r.incr(retry_key)
+                            if current_try == 1:
+                                await r.expire(retry_key, RETRY_TTL)
+                            if current_try <= MAX_RETRIES:
+                                await r.rpush(FETCH_QUEUE, url)
+                                STATS["retried"] += 1
+                            else:
+                                STATS["failed"] += 1
+                            continue
+                        if response.status != 200:
+                            STATS["failed"] += 1
+                            continue
+                        html_content = await response.read()
 
-            except Exception as e:
-                print(f"[{task_id}] ERROR on {url}: {e}")
+                    file_name = f"{hash_url(url)}.html"
+                    await s3_client.put_object(
+                        Bucket=S3_BUCKET, 
+                        Key=file_name, 
+                        Body=html_content,
+                    )
+
+                    message = json.dumps({
+                        "url": url,
+                        "s3_key": file_name,
+                        "fetched_at": time.time(),
+                        "worker": task_id,
+                    })
+                    
+                    await r.rpush(PARSE_QUEUE, message)
+                    STATS["fetched"] += 1
+
+                except Exception as e:
+                    print(f"[{task_id}] ERROR on {url}: {e}")
 
 
 async def main():
-    print("entered main async")
+    asyncio.create_task(make_report())
     hostname = socket.gethostname()
     pid = os.getpid()
 
-    loop = asyncio.get_running_loop()
-    try:
-        await loop.run_in_executor(
-            None, 
-            lambda: s3_client.create_bucket(Bucket=S3_BUCKET)
-        )
-        print(f"Bucket '{S3_BUCKET}' ready.")
-    except s3_client.exceptions.BucketAlreadyOwnedByYou:
-        pass
-    except s3_client.exceptions.BucketAlreadyExists:
-        pass
-
-    print(f"Starting Fetcher Node on {hostname} (PID: {pid})")
-    print(f"Launching {TASKS_PER_CONTAINER} async tasks...")
+    async with s3_session.client(
+                "s3",
+                endpoint_url=S3_ENDPOINT,
+                aws_access_key_id=AWS_KEY,
+                aws_secret_access_key=AWS_SECRET,
+                config=Config(signature_version='s3v4'),
+    ) as s3_client:
+        try:
+            await s3_client.create_bucket(Bucket=S3_BUCKET)
+            print(f"Bucket '{S3_BUCKET}' ready.")
+        except s3_client.exceptions.BucketAlreadyOwnedByYou:
+            pass
+        except s3_client.exceptions.BucketAlreadyExists:
+            pass
 
     tasks = []
     for i in range(TASKS_PER_CONTAINER):
@@ -134,7 +150,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Stopping fetchers...")
+    asyncio.run(main())
