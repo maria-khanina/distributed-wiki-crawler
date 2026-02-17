@@ -8,7 +8,9 @@ import hashlib
 import socket
 import time
 import redis.asyncio as redis
+from botocore.exceptions import ClientError
 from botocore.client import Config
+import gzip
 
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
@@ -16,15 +18,15 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 FETCH_QUEUE = os.getenv("FETCH_QUEUE", "queue:fetch")
 PARSE_QUEUE = os.getenv("PARSE_QUEUE", "queue:parse")
 
-S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
-S3_BUCKET = os.getenv("S3_BUCKET", "html_storage")
-AWS_KEY = os.getenv("AWS_ACCESS_KEY", "minioadmin")
-AWS_SECRET = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
+S3_ENDPOINT = os.environ["S3_ENDPOINT"]
+S3_BUCKET = os.environ["S3_BUCKET"]
+AWS_KEY = os.environ["AWS_ACCESS_KEY"]
+AWS_SECRET = os.environ["AWS_SECRET_ACCESS_KEY"]
 
 MAX_RETRIES = 3
 RETRY_TTL = 600
 
-TASKS_PER_CONTAINER = int(os.getenv("TASKS_PER_FETCHER", 50))
+TASKS_PER_CONTAINER = int(os.getenv("FETCHERS_PER_CONTAINER", 50))
 
 r = redis.Redis(
     host=REDIS_HOST, 
@@ -57,7 +59,7 @@ def hash_url(url: str) -> str:
 
 async def make_report():
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(10)
         print(f"--- FETCHER REPORT ---")
         print(f"Fetched: {STATS['fetched']}")
         print(f"Failed: {STATS['failed']}")
@@ -91,6 +93,7 @@ async def fetch_url(task_id: int):
                             if current_try == 1:
                                 await r.expire(retry_key, RETRY_TTL)
                             if current_try <= MAX_RETRIES:
+                                asyncio.sleep(2)
                                 await r.rpush(FETCH_QUEUE, url)
                                 STATS["retried"] += 1
                             else:
@@ -100,26 +103,43 @@ async def fetch_url(task_id: int):
                             STATS["failed"] += 1
                             continue
                         html_content = await response.read()
+                except Exception as e:
+                    print(f"[{task_id}] ERROR on {url}: {e}")
 
-                    file_name = f"{hash_url(url)}.html"
+                file_name = f"{hash_url(url)}.html"
+                compressed_html = await asyncio.to_thread(
+                    gzip.compress, 
+                    html_content, 
+                    compresslevel=1,
+                )
+                try:
                     await s3_client.put_object(
                         Bucket=S3_BUCKET, 
                         Key=file_name, 
-                        Body=html_content,
+                        Body=compressed_html,
+                        ContentEncoding='gzip',
+                        ContentType='text/html',
                     )
+                except ClientError as e:
+                    error_code = e.response.get("Error", {}).get("Code", "Unknown")
+                    if error_code == "XMinioStorageFull":
+                        print(f"MinIO Disk Full! Pausing for 60 seconds...")
+                        await asyncio.sleep(60)
+                        continue
+                    print(f"S3 Error ({error_code}): {e}")
 
-                    message = json.dumps({
-                        "url": url,
-                        "s3_key": file_name,
-                        "fetched_at": time.time(),
-                        "worker": task_id,
-                    })
-                    
+                message = json.dumps({
+                    "url": url,
+                    "s3_key": file_name,
+                    "fetched_at": time.time(),
+                    "worker": task_id,
+                })
+                
+                try:
                     await r.rpush(PARSE_QUEUE, message)
-                    STATS["fetched"] += 1
-
                 except Exception as e:
-                    print(f"[{task_id}] ERROR on {url}: {e}")
+                    print(f"Redis error: {e}")
+                STATS["fetched"] += 1
 
 
 async def main():

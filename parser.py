@@ -1,31 +1,28 @@
 import os
-
 import asyncio
 import json
 import socket
-import redis.asyncio as redis
-from botocore.client import Config
 import time
+import redis.asyncio as redis
 import aioboto3
-import json
-from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
+from botocore.config import Config
+from lxml import html
 from pymongo import AsyncMongoClient
+from urllib.parse import unquote
+import gzip
 
 
 MONGO_URI = os.environ["MONGO_URI"]
-
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = os.getenv("REDIS_PORT", 6379)
 FETCH_QUEUE = os.getenv("FETCH_QUEUE", "queue:fetch")
 PARSE_QUEUE = os.getenv("PARSE_QUEUE", "queue:parse")
 SEEN_SET = "seen_urls"
 
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
 S3_BUCKET = os.getenv("S3_BUCKET", "html-storage")
-AWS_ID = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
+AWS_ID = os.getenv("AWS_ACCESS_KEY", "minioadmin")
 AWS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
-
-TASKS_PER_CONTAINER = int(os.getenv("PARSERS_PER_PARSER", 50))
 
 DOMAIN = "he.wikipedia.org"
 
@@ -37,42 +34,84 @@ SYSTEM_PREFIXES = (
     "עזרה:",
     "תבנית:",
     "ויקיפדיה:",
+    "מיוחד:",
+    "פורטל:"
 )
 
 
-r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
-s3_session = aioboto3.Session()
+class Crawler:
+    def __init__(self, redis_client):
+        self.redis = redis_client
+        self.local_cache = set()
+        self.cache_limit = 50_000
 
-mongo_client = AsyncMongoClient(MONGO_URI)
-db = mongo_client.wikipedia_db
-pages_collection = db.pages
+    async def process(self, html_bytes, root_url, task_id, s3_key=None):
+        tree = html.fromstring(html_bytes)
+        tree.make_links_absolute(root_url)
 
-LOCAL_SEEN_SET = set()
+        met_links = set()
+        for _, _, link, _ in tree.iterlinks():
+            clean_url = link.split("#")[0]
+            if DOMAIN not in clean_url or "/wiki/" not in clean_url:
+                continue
+            decoded_url = unquote(clean_url)
+            try:
+                title = decoded_url.split("/wiki/")[1]
+            except IndexError:
+                continue
+            if title.startswith(SYSTEM_PREFIXES):
+                continue
+            met_links.add(clean_url)
+
+        unknown_links = [link for link in met_links if link not in self.local_cache]
+        new_links = []
+
+        if unknown_links:
+            pipe = self.redis.pipeline()
+            for link in unknown_links:
+                pipe.sadd(SEEN_SET, link)
+            results = await pipe.execute()
+
+            for link, is_new in zip(unknown_links, results):
+                self.local_cache.add(link)
+                if is_new:
+                    new_links.append(link)
+
+        if new_links:
+            await self.redis.rpush(FETCH_QUEUE, *new_links)
+
+        if len(self.local_cache) > self.cache_limit:
+            self.local_cache.clear()
+
+        print(f"[{task_id}] links: found {len(met_links)}, new {len(new_links)}")
 
 
-def crawl_links(html: str, base_url: str):
-    soup = BeautifulSoup(html, "lxml")
-    title = soup.title.string if soup.title else "No Title"
+class Downloader:
+    def __init__(self, mongo_client):
+        self.pages_collection = mongo_client.wikipedia_db.pages
 
-    links = set()
+    async def process(self, html_bytes, url, task_id, s3_key):
+        tree = html.fromstring(html_bytes)
+        
+        titles = tree.xpath('/html/head/title/text()')
+        title = titles[0] if titles else "No Title"
 
-    for link_tag in soup.find_all("a", href=True):
-        href = link_tag["href"]
-        full_url = urljoin(base_url, href)
-        clean_url = full_url.split("#")[0]
-        parsed_url = urlparse(clean_url)
-        path = parsed_url.path
-        title_start = path[6:]
-        if parsed_url.netloc in DOMAIN and \
-            path.startswith("/wiki/") and not \
-            title_start.startswith(SYSTEM_PREFIXES):
-                links.add(clean_url)
-                
-    return title, list(links)
+        text_content = tree.text_content()
+
+        await self.pages_collection.update_one(
+            {"url": url},
+            {"$set": {
+                "title": title,
+                "text": text_content,
+                "updated_at": time.time(),
+                "s3_key": s3_key,
+            }}, 
+            upsert=True
+        )
+        print(f"[{task_id}] saved content of {title} article")
 
 
-async def parse_pages(task_id):
-    loop = asyncio.get_running_loop()
+async def parser(task_id, worker: Crawler | Downloader, s3_session):
     async with s3_session.client(
         service_name="s3",
         endpoint_url=S3_ENDPOINT,
@@ -80,12 +119,21 @@ async def parse_pages(task_id):
         aws_secret_access_key=AWS_KEY,
         config=Config(signature_version="s3v4")
     ) as s3_client:
-        
+
+        redis_client = redis.Redis(
+            host=REDIS_HOST, 
+            port=REDIS_PORT, 
+            decode_responses=True,
+        )
+
         while True:
-            task_raw = await r.blpop(PARSE_QUEUE, timeout=5)
-            
+            try:
+                task_raw = await redis_client.blpop(PARSE_QUEUE, timeout=5)
+            except redis.ConnectionError:
+                await asyncio.sleep(2)
+                continue
+
             if not task_raw:
-                print("No tasks yet")
                 continue
 
             task = json.loads(task_raw[1])
@@ -94,66 +142,37 @@ async def parse_pages(task_id):
 
             try:
                 response = await s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
-                html_bytes = await response["Body"].read()
-                html_content = html_bytes.decode("utf-8")
-
-                title, crawled_links = await loop.run_in_executor(
-                    None, 
-                    crawl_links, 
-                    html_content,
-                    url,
-                )
-
-                document = {
-                    "url": url,
-                    "title": title,
-                    "updated_at": time.time(),
-                    "outgoing_links_count": len(crawled_links),
-                    "content": html_content,
-                    "outgoing_links": crawled_links
-                }
-
-                await pages_collection.replace_one(
-                    {"url": url}, 
-                    document, 
-                    upsert=True
-                )
-
-                pipe = r.pipeline()
-                for link in crawled_links:
-                    pipe.sadd(SEEN_SET, link)
-                
-                added_links = await pipe.execute()
-
-                new_links = []
-                for link, was_added in zip(crawled_links, added_links):
-                    if was_added == 1:
-                        new_links.append(link)
-
-                if new_links:
-                    await r.rpush(FETCH_QUEUE, *new_links)
-                                
-                print(
-                    f"[{task_id}] Parsed {url}: Found {len(crawled_links)}"
-                    f"links ({len(new_links)} new)"
-                )
+                compressed_bytes = await response["Body"].read()
+                html_bytes = gzip.decompress(compressed_bytes)
+                await worker.process(html_bytes, url, task_id, s3_key)
 
             except Exception as e:
-                print(f"[{task_id}] Error processing {url}: {e}")
+                print(f"[{task_id}] error: {e}")
 
 
 async def main():
     hostname = socket.gethostname()
-    pid = os.getpid()
+    mode = os.getenv("PARSER_MODE", "CRAWL")
+    tasks_count = int(os.getenv("TASKS_PER_CONTAINER", 10))
 
-    print(f"Starting Parser on {hostname} (PID: {pid})")
-    print(f"Launching {TASKS_PER_CONTAINER} async tasks...")
+    r_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    m_client = AsyncMongoClient(MONGO_URI)
+    s3_session = aioboto3.Session()
+
+
+    if mode == "CRAWL":
+        print(f"Starting in Crawler mode ({tasks_count} tasks)")
+        make_worker = lambda: Crawler(r_client)
+    elif mode == "DOWNLOAD":
+        print(f"Starting in Downloader mode ({tasks_count} tasks)")
+        make_worker = lambda: Downloader(m_client)
 
     tasks = []
-    for i in range(TASKS_PER_CONTAINER):
-        full_task_id = f"{hostname}_{pid}_task_{i}"
-        tasks.append(asyncio.create_task(parse_pages(full_task_id)))
-
+    for i in range(tasks_count):
+        task_id = f"{hostname}-{mode}-{i}"
+        worker = make_worker()
+        tasks.append(asyncio.create_task(parser(task_id, worker, s3_session)))
+    
     await asyncio.gather(*tasks)
 
 
