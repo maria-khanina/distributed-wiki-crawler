@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 from pymongo import AsyncMongoClient
 
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://REMOVED:REMOVED@mongo:27017")
+MONGO_URI = os.environ["MONGO_URI"]
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 FETCH_QUEUE = os.getenv("FETCH_QUEUE", "queue:fetch")

@@ -17,6 +17,19 @@ services:
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
+  
+  seeder:
+    build: .
+    container_name: seeder
+    command: python seed.py
+    restart: "no"
+    depends_on:
+      redis:
+        condition: service_started
+    volumes:
+    - .:/app
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
 
   fetcher:
     build: .
@@ -33,9 +46,12 @@ services:
     image: mongo
     container_name: pages_database
     ports:
-      - "${MONGO_PORT}:${MONGO_PORT}"
+      - "${MONGO_PORT}:27017"
     env_file:
       - .env
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
     volumes:
       - pages:/data/db
   parser:
@@ -51,7 +67,7 @@ services:
     env_file:
       - .env
     environment:
-      - MONGO_URI=mongodb://${MONGO_USER}:${MONGO_PASSWORD}@${MONGO_HOST}:${MONGO_PORT}
+      - MONGO_URI=mongodb://${MONGO_USER}:${MONGO_PASSWORD}@${MONGO_HOST}:27017/?authSource=admin
 
 
 volumes:

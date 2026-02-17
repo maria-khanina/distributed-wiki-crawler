@@ -78,6 +78,7 @@ async def fetch_url(task_id: int):
                 task_raw = await r.blpop(FETCH_QUEUE, timeout=5)
 
                 if not task_raw:
+                    print("No tasks for fetcher :(")
                     continue
 
                 url = task_raw[1]
