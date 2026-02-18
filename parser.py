@@ -143,7 +143,10 @@ async def parser(task_id, worker: Crawler | Downloader, s3_session):
             try:
                 response = await s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
                 compressed_bytes = await response["Body"].read()
-                html_bytes = gzip.decompress(compressed_bytes)
+                html_bytes = await asyncio.to_thread(
+                    gzip.decompress,
+                    compressed_bytes,
+                )
                 await worker.process(html_bytes, url, task_id, s3_key)
 
             except Exception as e:
