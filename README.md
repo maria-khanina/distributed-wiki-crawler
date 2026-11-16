@@ -34,6 +34,29 @@ MONGO_URI="mongodb://<user>:<password>@localhost:27017/?authSource=admin" python
 
 `mongo_verification.py` prints the number of stored pages and the last three of them.
 
+## Benchmark
+
+The `benchmark/` package compares the whole system with the most basic crawler: a single process that downloads one page at a time with `urllib`, parses it and writes it to MongoDB before taking the next URL (`benchmark/sequential_crawler.py`). Both start from the same nine articles and are timed until the pages reach MongoDB. `benchmark/system_timer.py` polls the page count of the Compose system.
+
+| Pages in MongoDB | Sequential crawler | Whole system | Speed-up |
+|---|---|---|---|
+| 50 | 31.1 s | 3.0 s | 10x |
+| 100 | 60.7 s | 21.7 s | 2.8x |
+| 300 | 415 s | 114.5 s | 3.6x |
+
+Wikipedia starts answering with HTTP 429 after the first 50 to 100 pages, so both crawlers slow down there and the speed-up at 300 pages (3.6x) is the fairer number; the 10x at the start is the speed before throttling. Each variant was run once. The sequential crawler had 4,769 failed requests on the way to 300 pages (rate limits and links to missing articles). In this run the S3-compatible storage was SeaweedFS instead of MinIO because the MinIO image could not be pulled; the services themselves were unchanged.
+
+To repeat the measurement (`MONGO_URI` is the connection string of the Compose MongoDB, `TARGET_PAGES` defaults to 300):
+
+```
+MONGO_URI="mongodb://<user>:<password>@localhost:27017/?authSource=admin" python -m benchmark.sequential_crawler
+docker compose up -d fetcher crawler downloader
+MONGO_URI="mongodb://<user>:<password>@localhost:27017/?authSource=admin" python -m benchmark.system_timer &
+docker compose run --rm seeder
+```
+
+Remove the volumes with `docker compose down -v` between runs: the system run needs an empty `pages` collection.
+
 ## Code quality
 
 The code is checked with `python -m pycodestyle --max-line-length=88 --exclude=.venv,typings,tools .`, `python -m pyright` (strict, with local stubs in `typings/` for `aioboto3`, `botocore`, `lxml.html` and the parts of `redis` the services use) and the AST checker [tools/rules_check.py](tools/rules_check.py) (`python tools/rules_check.py .`): at most 10 statements per function, no magic numbers outside `crawler_settings.py`, type hints on containers, no abbreviations or single-letter names, ordered imports.
